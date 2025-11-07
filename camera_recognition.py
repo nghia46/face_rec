@@ -1,16 +1,17 @@
-# camera_recognition.py
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 import os
+from fastapi import FastAPI, File, UploadFile, HTTPException
+import uvicorn
 
 # === KHỞI TẠO INSIGHTFACE ===
-app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
-app.prepare(ctx_id=-1, det_size=(640, 640))  # CPU
+face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=-1, det_size=(640, 640))
 
-# === LOAD EMBEDDING TỪ known_faces ===
+# === LOAD EMBEDDINGS ===
 EMBEDDINGS_DIR = "known_faces"
-KNOWN_CACHE = {}  # code -> (name, embedding)
+KNOWN_CACHE = {}
 
 def load_embeddings():
     if not os.path.exists(EMBEDDINGS_DIR):
@@ -30,64 +31,64 @@ def load_embeddings():
 
 load_embeddings()
 
-if not KNOWN_CACHE:
-    print("Không có nhân viên nào trong cơ sở dữ liệu!")
-    exit()
+# === FASTAPI APP ===
+app = FastAPI(title="Face Recognition API - 404 on No Face")
 
-# === MỞ CAMERA ===
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Không mở được camera!")
-    exit()
+@app.post("/recognize")
+async def recognize_face(file: UploadFile = File(...)):
+    # Kiểm tra loại file
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File phải là ảnh!")
 
-print("\nCAMERA ĐÃ MỞ – NHẤN 'q' ĐỂ THOÁT\n")
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Lỗi đọc frame!")
-        break
-
-    # === NHẬN DIỆN KHUÔN MẶT ===
-    faces = app.get(frame)
+    # Đọc ảnh
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
-    for face in faces:
-        # Lấy embedding
-        embedding = face.normed_embedding
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Không thể đọc ảnh. File không hợp lệ.")
 
-        # So sánh với tất cả người trong DB
-        best_match = None
+    # Phát hiện khuôn mặt
+    faces = face_app.get(frame)
+
+    # === KHÔNG CÓ KHUÔN MẶT → 404 ===
+    if not faces:
+        raise HTTPException(
+            status_code=404,
+            detail="Không phát hiện khuôn mặt nào trong ảnh."
+        )
+
+    # === CÓ KHUÔN MẶT → XỬ LÝ NHẬN DIỆN ===
+    results = []
+    for face in faces:
+        embedding = face.normed_embedding
         best_score = 0.0
+        best_name = "Unknown"
         best_code = None
 
         for code, (name, known_emb) in KNOWN_CACHE.items():
             score = np.dot(embedding, known_emb)
             if score > best_score:
                 best_score = score
-                best_match = name
+                best_name = name
                 best_code = code
 
-        # Vẽ khung + tên
-        bbox = face.bbox.astype(int)
-        x1, y1, x2, y2 = bbox
+        confidence = float(best_score * 100)
+        recognized = bool(best_score >= 0.4)
+        bbox = [int(float(x)) for x in face.bbox]
 
-        # Màu: xanh = khớp, đỏ = không
-        color = (0, 255, 0) if best_score >= 0.4 else (0, 0, 255)
-        label = f"{best_match} ({best_score*100:.1f}%)" if best_score >= 0.4 else "Unknown"
+        results.append({
+            "code": best_code,
+            "name": best_name if recognized else "Unknown",
+            "confidence": round(confidence, 2),
+            "bbox": bbox,
+            "recognized": recognized
+        })
 
-        # Vẽ
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, y1 - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    return {"results": results}
 
-    # === HIỂN THỊ ===
-    cv2.imshow('Face Recognition - InsightFace', frame)
-
-    # Nhấn 'q' để thoát
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# === DỌN DẸP ===
-cap.release()
-cv2.destroyAllWindows()
-print("Đã đóng camera.")
+# === CHẠY SERVER ===
+if __name__ == "__main__":
+    print("\nAPI RUNNING: http://127.0.0.1:8000")
+    print("→ Không có khuôn mặt → HTTP 404")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
