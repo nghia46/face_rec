@@ -2,3 +2,5 @@ insightface
 onnxruntime
 opencv-python
 numpy
+uvicorn
+fastapi
