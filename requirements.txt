@@ -3,4 +3,6 @@ onnxruntime
 opencv-python
 numpy
 uvicorn
+orjson
 fastapi
+python-multipart
