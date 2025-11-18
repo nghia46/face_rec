@@ -4,31 +4,30 @@ import os
 import glob
 from insightface.app import FaceAnalysis
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from typing import Optional, Tuple
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from PIL import Image
+import traceback
 
 # ================== CẤU HÌNH ==================
 EMBEDDINGS_DIR = "known_faces"
-THRESHOLD = 0.50              # Nhận diện: 50% trở lên
-DUPLICATE_THRESHOLD = 0.65    # Trùng lặp: 65% trở lên (cao hơn 15%)
+THRESHOLD = 0.50              
+DUPLICATE_THRESHOLD = 0.65    
 MAX_SIZE = 256
 MAX_FILE_SIZE = 2_000_000
 MODEL_NAME = "buffalo_sc"
 
-# Preprocessing configs
 USE_PILLOW = True
 SKIP_GRAYSCALE = True
 TARGET_FORMAT = "RGB"
 
-# Thread pool
 executor = ThreadPoolExecutor(max_workers=4)
 
-# Messages
 MSG_NOT_REGISTERED = "Chưa đăng ký"
 MSG_UNKNOWN = "Unknown"
 
@@ -36,7 +35,6 @@ os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 
 # ================== VALIDATION ==================
 def validate_thresholds():
-    """Kiểm tra logic ngưỡng"""
     if DUPLICATE_THRESHOLD <= THRESHOLD:
         raise ValueError(
             f"LOGIC SAI!\n"
@@ -48,11 +46,11 @@ def validate_thresholds():
     if gap < 0.05:
         print(f"Cảnh báo: Khoảng cách giữa 2 ngưỡng quá nhỏ ({gap:.2f})")
         print(f"    Khuyến nghị: Tối thiểu 0.10 để tránh xung đột")
+
 validate_thresholds()
 
 # ================== HELPER FUNCTIONS ==================
 def extract_name_from_path(path: str) -> str:
-    """Trích xuất tên từ đường dẫn file"""
     try:
         filename = os.path.basename(path)
         name_part = filename.split("_", 1)[1].replace(".npy", "")
@@ -61,30 +59,33 @@ def extract_name_from_path(path: str) -> str:
         return MSG_UNKNOWN
 
 def find_embedding_file(code: str) -> Optional[str]:
-    """Tìm file embedding theo code"""
     files = glob.glob(os.path.join(EMBEDDINGS_DIR, f"{code}_*.npy"))
     return files[0] if files else None
 
 # ================== MODEL ==================
 face_app = None
+
 def get_model() -> FaceAnalysis:
     global face_app
     if face_app is None:
-        print(f"Đang tải model: {MODEL_NAME} (det_size={MAX_SIZE})...")
-        face_app = FaceAnalysis(name=MODEL_NAME, providers=['CPUExecutionProvider'])
-        face_app.prepare(ctx_id=-1, det_size=(MAX_SIZE, MAX_SIZE))
-        
-        # Warm-up
-        dummy = np.zeros((MAX_SIZE, MAX_SIZE, 3), dtype=np.uint8)
-        face_app.get(dummy)
-        print("Model sẵn sàng!")
+        try:
+            print(f"Đang tải model: {MODEL_NAME} (det_size={MAX_SIZE})...")
+            face_app = FaceAnalysis(name=MODEL_NAME, providers=['CPUExecutionProvider'])
+            face_app.prepare(ctx_id=-1, det_size=(MAX_SIZE, MAX_SIZE))
+            
+            dummy = np.zeros((MAX_SIZE, MAX_SIZE, 3), dtype=np.uint8)
+            face_app.get(dummy)
+            print("✅ Model sẵn sàng!")
+        except Exception as e:
+            print(f"❌ LỖI TẢI MODEL: {e}")
+            traceback.print_exc()
+            raise
     return face_app
 
-# ================== CACHE (SỬA LỖI) ==================
+# ================== CACHE ==================
 embeddings_cache = {}
 
 def preload_all_embeddings():
-    """Load tất cả embeddings vào RAM – ĐẢM BẢO ĐỒNG BỘ"""
     global embeddings_cache
     embeddings_cache.clear()
     files = glob.glob(os.path.join(EMBEDDINGS_DIR, "*.npy"))
@@ -99,14 +100,12 @@ def preload_all_embeddings():
             loaded += 1
         except Exception as e:
             print(f"[ERROR] Lỗi load {path}: {e}")
-    print(f"Đã load {loaded}/{len(files)} embeddings vào cache")
+    print(f"✅ Đã load {loaded}/{len(files)} embeddings vào cache")
 
 def get_embedding(code: str) -> Optional[Tuple[str, np.ndarray]]:
-    """Lấy embedding trực tiếp từ cache dict"""
     return embeddings_cache.get(code)
 
 def refresh_cache():
-    """Reload cache sau mỗi thay đổi (register/delete)"""
     preload_all_embeddings()
 
 # ================== DUPLICATE DETECTION ==================
@@ -195,32 +194,73 @@ def classify_confidence(score: float) -> dict:
 
 # ================== FASTAPI ==================
 app = FastAPI(
-    title="Face Recognition API (Ultra Fast + Duplicate Check)",
-    default_response_class=ORJSONResponse
+    title="Face Recognition API",
+    description="Ultra Fast Face Recognition with Duplicate Detection",
+    version="1.0.0"
 )
+
+# Add CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ✅ ERROR HANDLER - BẮT MỌI LỖI 500
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    print(f"❌ GLOBAL ERROR: {exc}")
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal Server Error",
+            "message": str(exc),
+            "type": type(exc).__name__
+        }
+    )
 
 @app.on_event("startup")
 async def startup_event():
-    print("Đang khởi động...")
-    get_model()
-    preload_all_embeddings()
-    print(f"Sẵn sàng! (Preprocessing: {'PIL' if USE_PILLOW else 'OpenCV'})")
-    print(f"Recognition threshold: {THRESHOLD} ({THRESHOLD*100:.0f}%)")
-    print(f"Duplicate threshold: {DUPLICATE_THRESHOLD} ({DUPLICATE_THRESHOLD*100:.0f}%)")
-    print(f"Gap: {DUPLICATE_THRESHOLD - THRESHOLD:.2f}\n")
+    try:
+        print("🚀 Đang khởi động...")
+        print(f"Preprocessing: {'PIL' if USE_PILLOW else 'OpenCV'}")
+        print(f"Recognition threshold: {THRESHOLD} ({THRESHOLD*100:.0f}%)")
+        print(f"Duplicate threshold: {DUPLICATE_THRESHOLD} ({DUPLICATE_THRESHOLD*100:.0f}%)")
+        
+        # Load embeddings first (không cần model)
+        preload_all_embeddings()
+        
+        # Model sẽ được load lazy khi cần
+        print("✅ API sẵn sàng! Model sẽ load khi có request đầu tiên.")
+        
+    except Exception as e:
+        print(f"❌ LỖI KHỞI ĐỘNG: {e}")
+        traceback.print_exc()
 
+# ✅ HEALTH CHECK - KHÔNG CẦN MODEL
 @app.get("/")
 async def home():
     return {
         "status": "running",
+        "message": "Face Recognition API is running",
         "model": MODEL_NAME,
         "det_size": MAX_SIZE,
         "threshold": THRESHOLD,
         "duplicate_threshold": DUPLICATE_THRESHOLD,
-        "threshold_gap": round(DUPLICATE_THRESHOLD - THRESHOLD, 2),
-        "preprocessing": "PIL" if USE_PILLOW else "OpenCV",
         "cached_faces": len(embeddings_cache),
+        "model_loaded": face_app is not None,
         "docs": "/docs"
+    }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "cached_faces": len(embeddings_cache),
+        "model_loaded": face_app is not None
     }
 
 @app.post("/register")
@@ -229,186 +269,98 @@ async def register(
     name: str = Form(...),
     file: UploadFile = File(...)
 ):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(400, "File phải là ảnh (image/*)")
-    
-    if code in embeddings_cache:
-        old_name = embeddings_cache[code][0]
-        raise HTTPException(400, f"Mã {code} đã được đăng ký cho: {old_name}")
-    
-    file_bytes = await file.read()
-    img = await preprocess(file_bytes)
-    faces = await detect_faces(img)
-    
-    if not faces:
-        raise HTTPException(400, "Không phát hiện khuôn mặt trong ảnh")
-    
-    new_embedding = faces[0].normed_embedding.astype(np.float32)
-    duplicate = await check_duplicate_face_async(new_embedding)
-    if duplicate:
-        dup_code, dup_name, similarity = duplicate
-        raise HTTPException(
-            409,
-            f"Khuôn mặt đã được đăng ký!\nMã: {dup_code} | Tên: {dup_name}\nĐộ tương đồng: {similarity*100:.1f}%"
-        )
-    
-    safe_name = name.replace(' ', '_')
-    path = os.path.join(EMBEDDINGS_DIR, f"{code}_{safe_name}.npy")
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, np.save, path, new_embedding)
-    
-    embeddings_cache[code] = (name, new_embedding)
-    refresh_cache()  # ← ĐẢM BẢO ĐỒNG BỘ
-    
-    print(f"Đăng ký: {code} - {name}")
-    return {
-        "success": True,
-        "code": code,
-        "name": name,
-        "message": "Đăng ký thành công"
-    }
+    try:
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(400, "File phải là ảnh (image/*)")
+        
+        if code in embeddings_cache:
+            old_name = embeddings_cache[code][0]
+            raise HTTPException(400, f"Mã {code} đã được đăng ký cho: {old_name}")
+        
+        file_bytes = await file.read()
+        img = await preprocess(file_bytes)
+        faces = await detect_faces(img)
+        
+        if not faces:
+            raise HTTPException(400, "Không phát hiện khuôn mặt trong ảnh")
+        
+        new_embedding = faces[0].normed_embedding.astype(np.float32)
+        duplicate = await check_duplicate_face_async(new_embedding)
+        
+        if duplicate:
+            dup_code, dup_name, similarity = duplicate
+            raise HTTPException(
+                409,
+                f"Khuôn mặt đã được đăng ký!\nMã: {dup_code} | Tên: {dup_name}\nĐộ tương đồng: {similarity*100:.1f}%"
+            )
+        
+        safe_name = name.replace(' ', '_')
+        path = os.path.join(EMBEDDINGS_DIR, f"{code}_{safe_name}.npy")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, np.save, path, new_embedding)
+        
+        embeddings_cache[code] = (name, new_embedding)
+        
+        print(f"✅ Đăng ký: {code} - {name}")
+        return {
+            "success": True,
+            "code": code,
+            "name": name,
+            "message": "Đăng ký thành công"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Register error: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, f"Lỗi đăng ký: {str(e)}")
 
 @app.post("/recognize")
 async def recognize(
     code: str = Form(...),
     file: UploadFile = File(...)
 ):
-    cached = get_embedding(code)
-    if not cached:
+    try:
+        cached = get_embedding(code)
+        if not cached:
+            return {
+                "code": code,
+                "recognized": False,
+                "message": MSG_NOT_REGISTERED
+            }
+        
+        if not file.content_type or not file.content_type.startswith("image/"):
+            raise HTTPException(400, "File phải là ảnh (image/*)")
+        
+        file_bytes = await file.read()
+        img = await preprocess(file_bytes)
+        faces = await detect_faces(img)
+        
+        if not faces:
+            raise HTTPException(404, "Không phát hiện khuôn mặt trong ảnh")
+        
+        query_emb = faces[0].normed_embedding.astype(np.float32)
+        name, known_emb = cached
+        score = float(np.dot(query_emb, known_emb))
+        confidence = round(score * 100, 2)
+        recognized = score >= THRESHOLD
+        conf_class = classify_confidence(score)
+        
         return {
             "code": code,
-            "recognized": False,
-            "message": MSG_NOT_REGISTERED
+            "name": name if recognized else MSG_UNKNOWN,
+            "confidence": confidence,
+            "confidence_level": conf_class["level"],
+            "confidence_label": conf_class["label"],
+            "recognized": recognized,
+            "bbox": [int(x) for x in faces[0].bbox]
         }
-    
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(400, "File phải là ảnh (image/*)")
-    
-    file_bytes = await file.read()
-    img = await preprocess(file_bytes)
-    faces = await detect_faces(img)
-    
-    if not faces:
-        raise HTTPException(404, "Không phát hiện khuôn mặt trong ảnh")
-    
-    query_emb = faces[0].normed_embedding.astype(np.float32)
-    name, known_emb = cached
-    score = float(np.dot(query_emb, known_emb))
-    confidence = round(score * 100, 2)
-    recognized = score >= THRESHOLD
-    conf_class = classify_confidence(score)
-    
-    return {
-        "code": code,
-        "name": name if recognized else MSG_UNKNOWN,
-        "confidence": confidence,
-        "confidence_level": conf_class["level"],
-        "confidence_label": conf_class["label"],
-        "recognized": recognized,
-        "bbox": [int(x) for x in faces[0].bbox]
-    }
-
-@app.post("/check-duplicate")
-async def check_duplicate_endpoint(file: UploadFile = File(...)):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(400, "File phải là ảnh (image/*)")
-    
-    file_bytes = await file.read()
-    img = await preprocess(file_bytes)
-    faces = await detect_faces(img)
-    
-    if not faces:
-        raise HTTPException(400, "Không phát hiện khuôn mặt trong ảnh")
-    
-    new_embedding = faces[0].normed_embedding.astype(np.float32)
-    duplicate = await check_duplicate_face_async(new_embedding)
-    
-    if duplicate:
-        dup_code, dup_name, similarity = duplicate
-        return {
-            "is_duplicate": True,
-            "matched_code": dup_code,
-            "matched_name": dup_name,
-            "similarity": round(similarity * 100, 2)
-        }
-    else:
-        return {
-            "is_duplicate": False,
-            "message": "Khuôn mặt chưa được đăng ký"
-        }
-
-@app.delete("/delete/{code}")
-async def delete_by_code(code: str):
-    if code not in embeddings_cache:
-        raise HTTPException(404, f"Không tìm thấy mã {code}")
-    
-    name, _ = embeddings_cache[code]
-    file_path = find_embedding_file(code)
-    if file_path and os.path.exists(file_path):
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(executor, os.remove, file_path)
-    
-    del embeddings_cache[code]
-    refresh_cache()  # ← Đồng bộ
-    
-    print(f"Đã xóa: {code} - {name}")
-    return {
-        "success": True,
-        "deleted_code": code,
-        "deleted_name": name,
-        "message": f"Đã xóa {name} (mã: {code})"
-    }
-
-@app.post("/delete-by-name")
-async def delete_by_name(name: str = Form(...)):
-    deleted = []
-    name_lower = name.lower()
-    codes_to_delete = [code for code, (cached_name, _) in embeddings_cache.items() if cached_name.lower() == name_lower]
-    
-    if not codes_to_delete:
-        raise HTTPException(404, f"Không tìm thấy người có tên '{name}'")
-    
-    for code in codes_to_delete:
-        cached_name, _ = embeddings_cache[code]
-        file_path = find_embedding_file(code)
-        if file_path and os.path.exists(file_path):
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(executor, os.remove, file_path)
-        del embeddings_cache[code]
-        deleted.append({"code": code, "name": cached_name})
-        print(f"Đã xóa: {code} - {cached_name}")
-    
-    refresh_cache()
-    return {
-        "success": True,
-        "deleted_count": len(deleted),
-        "deleted_records": deleted,
-        "message": f"Đã xóa {len(deleted)} bản ghi có tên '{name}'"
-    }
-
-@app.delete("/delete-all")
-async def delete_all(confirm: str = Form(...)):
-    if confirm != "DELETE_ALL":
-        raise HTTPException(400, "Xác nhận không đúng! Nhập 'DELETE_ALL' để xóa tất cả")
-    
-    if not embeddings_cache:
-        return {"success": True, "deleted_count": 0, "message": "Không có dữ liệu để xóa"}
-    
-    deleted_count = len(embeddings_cache)
-    files = glob.glob(os.path.join(EMBEDDINGS_DIR, "*.npy"))
-    loop = asyncio.get_event_loop()
-    for file_path in files:
-        await loop.run_in_executor(executor, os.remove, file_path)
-    
-    embeddings_cache.clear()
-    refresh_cache()
-    
-    print(f"ĐÃ XÓA TẤT CẢ: {deleted_count} khuôn mặt")
-    return {
-        "success": True,
-        "deleted_count": deleted_count,
-        "message": f"Đã xóa toàn bộ {deleted_count} khuôn mặt"
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Recognize error: {e}")
+        traceback.print_exc()
+        raise HTTPException(500, f"Lỗi nhận diện: {str(e)}")
 
 @app.get("/list")
 async def list_all():
@@ -427,60 +379,39 @@ async def list_all():
     faces.sort(key=lambda x: x["code"])
     return {"total": len(faces), "faces": faces}
 
-@app.get("/stats")
-async def stats():
+@app.delete("/delete/{code}")
+async def delete_by_code(code: str):
+    if code not in embeddings_cache:
+        raise HTTPException(404, f"Không tìm thấy mã {code}")
+    
+    name, _ = embeddings_cache[code]
+    file_path = find_embedding_file(code)
+    if file_path and os.path.exists(file_path):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, os.remove, file_path)
+    
+    del embeddings_cache[code]
+    
+    print(f"✅ Đã xóa: {code} - {name}")
     return {
-        "total_registered": len(embeddings_cache),
-        "preprocessing": "PIL (LANCZOS)" if USE_PILLOW else "OpenCV (LINEAR)",
-        "max_size": MAX_SIZE,
-        "threshold": THRESHOLD,
-        "duplicate_threshold": DUPLICATE_THRESHOLD,
-        "threshold_gap": round(DUPLICATE_THRESHOLD - THRESHOLD, 2),
-        "logic_valid": DUPLICATE_THRESHOLD > THRESHOLD
-    }
-
-@app.get("/test-thresholds")
-async def test_thresholds():
-    test_scores = [0.85, 0.75, 0.65, 0.55, 0.45, 0.35]
-    results = []
-    for score in test_scores:
-        conf_class = classify_confidence(score)
-        results.append({
-            "similarity": score,
-            "confidence_pct": round(score * 100, 1),
-            "would_recognize": score >= THRESHOLD,
-            "would_block_duplicate": score >= DUPLICATE_THRESHOLD,
-            "classification": conf_class["label"],
-            "emoji": conf_class["emoji"]
-        })
-    return {
-        "threshold_config": {
-            "recognition": THRESHOLD,
-            "duplicate": DUPLICATE_THRESHOLD,
-            "gap": round(DUPLICATE_THRESHOLD - THRESHOLD, 2)
-        },
-        "test_results": results,
-        "explanation": {
-            "recognition_zone": f"≥ {THRESHOLD:.2f} → Nhận diện thành công",
-            "gray_zone": f"{THRESHOLD:.2f} - {DUPLICATE_THRESHOLD:.2f} → Nhận diện OK, có thể đăng ký người khác",
-            "duplicate_zone": f"≥ {DUPLICATE_THRESHOLD:.2f} → Chặn đăng ký (trùng lặp)"
-        }
+        "success": True,
+        "deleted_code": code,
+        "deleted_name": name,
+        "message": f"Đã xóa {name} (mã: {code})"
     }
 
 # ================== RUN ==================
 if __name__ == "__main__":
-    print(f"\nFace Recognition API (ULTRA FAST + DUPLICATE CHECK)")
+    print(f"\n🚀 Face Recognition API")
     print(f"Model: {MODEL_NAME} | Size: {MAX_SIZE}px")
     print(f"Preprocessing: {'PIL (3x faster)' if USE_PILLOW else 'OpenCV'}")
-    print(f"Recognition threshold: {THRESHOLD} ({THRESHOLD*100:.0f}%)")
-    print(f"Duplicate threshold: {DUPLICATE_THRESHOLD} ({DUPLICATE_THRESHOLD*100:.0f}%)")
-    print(f"Gap: {DUPLICATE_THRESHOLD - THRESHOLD:.2f}\n")
+    print(f"Thresholds: Recognition={THRESHOLD} | Duplicate={DUPLICATE_THRESHOLD}\n")
     
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        workers=2,
+        workers=1,  # ✅ CHỈ DÙNG 1 WORKER
         reload=False,
-        log_level="warning"
+        log_level="info"  # ✅ ĐỔI THÀNH INFO ĐỂ XEM LOG
     )
